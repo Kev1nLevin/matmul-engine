@@ -8,7 +8,7 @@
 // =============================================================================
 
 module processing_element #(
-    parameter DATA_WIDTH = 8,
+    parameter DATA_WIDTH = 16,  // BF16
     parameter ACC_WIDTH  = 32
 )(
     input  logic                         clk,
@@ -28,23 +28,18 @@ module processing_element #(
     output logic signed [ACC_WIDTH-1:0]  result_out  // Accumulated result
 );
 
-    // -------------------------------------------------------------------------
-    // Systolic data flow registers
-    // Pass-through with 1-cycle delay for systolic timing
-    // -------------------------------------------------------------------------
+    // Systolic pass-through: 1-cycle delay propagates data to neighbor PEs
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             a_out <= '0;
             b_out <= '0;
         end else if (en) begin
-            a_out <= a_in;  // Pass weight downward
-            b_out <= b_in;  // Pass activation rightward
+            a_out <= a_in;
+            b_out <= b_in;
         end
     end
 
-    // -------------------------------------------------------------------------
-    // MAC Unit instantiation
-    // -------------------------------------------------------------------------
+
     mac_unit #(
         .DATA_WIDTH (DATA_WIDTH),
         .ACC_WIDTH  (ACC_WIDTH)

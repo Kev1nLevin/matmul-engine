@@ -5,22 +5,17 @@
 //              1. IDLE    -> Wait for start signal
 //              2. CLEAR   -> Clear accumulators and skew registers
 //              3. LOAD    -> Feed skewed inputs (N cycles)
-//              4. DRAIN   -> Wait for full propagation (2*(N-1) cycles)
+//              4. DRAIN   -> Wait for full propagation (2*(N-1) + (MAC_LATENCY-1) cycles)
 //              5. DONE    -> Signal completion, results are valid
 //
-//              Total computation: N + 2*(N-1) = 3N - 2 cycles
-//              For 4x4: 10 cycles.  For 8x8: 22 cycles.
-//
-//              The drain must be 2*(N-1) because:
-//              - N-1 cycles for the skew controller to flush channel N-1
-//              - N-1 cycles for that data to propagate to PE[N-1][N-1]
-//
-//              Fully parameterized — works for any ARRAY_SIZE (4, 8, 16, etc.)
+//              Total active cycles: N + 2*(N-1) + (MAC_LATENCY-1)
+//              For 32x32, MAC_LATENCY=2: 32 + 62 + 1 = 95 cycles
 // =============================================================================
 
 module systolic_controller #(
-    parameter ARRAY_SIZE = 4,
-    parameter CNT_WIDTH  = $clog2(3*ARRAY_SIZE)  // bits needed for 3N-2 count
+    parameter ARRAY_SIZE  = 32,
+    parameter MAC_LATENCY = 2,   // extra drain cycles = MAC_LATENCY - 1
+    parameter CNT_WIDTH   = $clog2(3*ARRAY_SIZE + MAC_LATENCY)
 )(
     input  logic                  clk,
     input  logic                  rst_n,
@@ -54,9 +49,9 @@ module systolic_controller #(
     state_t state, next_state;
 
     // Total cycles needed
-    localparam FEED_CYCLES  = ARRAY_SIZE;                       // N cycles to load
-    localparam DRAIN_CYCLES = 2 * (ARRAY_SIZE - 1);             // 2*(N-1) cycles to drain
-    localparam TOTAL_CYCLES = FEED_CYCLES + DRAIN_CYCLES;       // 3N-2 total
+    localparam FEED_CYCLES  = ARRAY_SIZE;                                  // N cycles to load
+    localparam DRAIN_CYCLES = 2 * (ARRAY_SIZE - 1) + (MAC_LATENCY - 1);   // 2*(N-1) + pipeline latency
+    localparam TOTAL_CYCLES = FEED_CYCLES + DRAIN_CYCLES;
 
     logic [CNT_WIDTH-1:0] counter;
 

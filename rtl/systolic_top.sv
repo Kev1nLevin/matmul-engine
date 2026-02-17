@@ -12,16 +12,16 @@
 //              - A rows flow left-to-right through b_row (horizontal)
 //              - PE[i][j] accumulates: sum_k A[i][k] * B[k][j]
 //
-//              Fully parameterized — works for any ARRAY_SIZE (4, 8, 16, etc.)
 //              Target: ASAP7 7nm PDK
 // =============================================================================
 
 module systolic_top #(
-    parameter ARRAY_SIZE = 4,
-    parameter DATA_WIDTH = 8,
-    parameter ACC_WIDTH  = 32,
-    parameter ADDR_WIDTH = $clog2(ARRAY_SIZE),
-    parameter CNT_WIDTH  = $clog2(3*ARRAY_SIZE)
+    parameter ARRAY_SIZE = 32,
+    parameter DATA_WIDTH  = 16,  // BF16
+    parameter ACC_WIDTH   = 32,  // FP32
+    parameter MAC_LATENCY = 2,   // mac_unit pipeline stages
+    parameter ADDR_WIDTH  = $clog2(ARRAY_SIZE),
+    parameter CNT_WIDTH   = $clog2(3*ARRAY_SIZE + MAC_LATENCY)
 )(
     input  logic                         clk,
     input  logic                         rst_n,
@@ -39,7 +39,10 @@ module systolic_top #(
 
     // ---- Result Interface ----
     input  logic [ADDR_WIDTH-1:0]        rd_row_addr, // Read row address for result
-    output logic signed [ACC_WIDTH-1:0]  rd_data [ARRAY_SIZE]   // Result row (N elements)
+    output logic signed [ACC_WIDTH-1:0]  rd_data [ARRAY_SIZE],  // Result row (N elements)
+
+    // ---- Activation ----
+    input  logic                         gelu_en      // 1 = apply GeLU to result on read
 );
 
     // =========================================================================
@@ -95,22 +98,13 @@ module systolic_top #(
     end
 
     // =========================================================================
-    // Input Feeding Logic
-    // During LOAD phase, cycle_count selects which column/row to feed
-    //
-    // For C = A × B:
-    //   a_col (top edge, flows down)   ← columns of B: B[cycle][i]
-    //   b_row (left edge, flows right) ← rows of A:    A[i][cycle]
-    //
-    // This ensures PE[i][j] = sum_k B[k][j] * A[i][k] = sum_k A[i][k]*B[k][j]
+    // Input Feeding: cycle_count selects the current B column / A row to stream in
     // =========================================================================
     always_comb begin
         for (int i = 0; i < ARRAY_SIZE; i++) begin
             if (cycle_count < CNT_WIDTH'(ARRAY_SIZE)) begin
-                // Row cycle_count of B feeds the top edge (flows down through columns)
-                a_feed_in[i] = mat_b[cycle_count[ADDR_WIDTH-1:0]][i];
-                // Column cycle_count of A feeds the left edge (flows right through rows)
-                b_feed_in[i] = mat_a[i][cycle_count[ADDR_WIDTH-1:0]];
+                a_feed_in[i] = mat_b[cycle_count[ADDR_WIDTH-1:0]][i];  // B column → top edge
+                b_feed_in[i] = mat_a[i][cycle_count[ADDR_WIDTH-1:0]];  // A row  → left edge
             end else begin
                 a_feed_in[i] = '0;
                 b_feed_in[i] = '0;
@@ -151,7 +145,7 @@ module systolic_top #(
     // =========================================================================
     // NxN Systolic Array
     // =========================================================================
-    systolic_array_4x4 #(
+    systolic_array_32x32 #(
         .ARRAY_SIZE (ARRAY_SIZE),
         .DATA_WIDTH (DATA_WIDTH),
         .ACC_WIDTH  (ACC_WIDTH)
@@ -169,7 +163,8 @@ module systolic_top #(
     // Controller FSM
     // =========================================================================
     systolic_controller #(
-        .ARRAY_SIZE (ARRAY_SIZE)
+        .ARRAY_SIZE  (ARRAY_SIZE),
+        .MAC_LATENCY (MAC_LATENCY)
     ) u_ctrl (
         .clk          (clk),
         .rst_n        (rst_n),
@@ -184,12 +179,18 @@ module systolic_top #(
     );
 
     // =========================================================================
-    // Result Read Interface
+    // Result Read — ARRAY_SIZE parallel gelu_unit instances on the selected row
+    // gelu_en=0: passthrough  gelu_en=1: GeLU(accumulator)
     // =========================================================================
-    always_comb begin
-        for (int j = 0; j < ARRAY_SIZE; j++) begin
-            rd_data[j] = result_matrix[rd_row_addr][j];
+    genvar gj;
+    generate
+        for (gj = 0; gj < ARRAY_SIZE; gj++) begin : gen_gelu
+            gelu_unit u_gelu (
+                .fp32_in  (result_matrix[rd_row_addr][gj]),
+                .gelu_en  (gelu_en),
+                .fp32_out (rd_data[gj])
+            );
         end
-    end
+    endgenerate
 
 endmodule

@@ -1,4 +1,4 @@
-# tinyTPU — Scalable Systolic Array Neural Network Accelerator
+# tinyTPU — 32×32 BF16 Systolic Array Neural Network Accelerator
 
 ## RTL-to-GDS | Cadence Flow | ASAP7 7nm PDK
 
@@ -11,77 +11,69 @@
 
 ## Overview
 
-A fully synthesizable **parameterized output-stationary systolic array** for INT8 matrix multiplication, targeting neural network inference acceleration. The design is implemented through the complete **RTL-to-GDS** physical design flow using Cadence tools on the **ASAP7 7nm** FinFET PDK.
+A fully synthesizable **parameterized output-stationary systolic array** for neural network inference, targeting ASAP7 7nm FinFET. The design has evolved from a validated INT8 4×4/8×8 baseline through the full RTL-to-GDS flow to the current **32×32 BF16** configuration with AXI4 SoC integration and GeLU activation.
 
-Both **4×4** and **8×8** array configurations have been taken through the full P&R flow and are timing-clean at **667 MHz**.
+**Current RTL configuration:**
+- **32×32 array** — 1024 PEs, 32-bit FP32 accumulators
+- **BF16 inputs** — 2-stage pipelined BF16×BF16→FP32 MAC per PE
+- **AXI4 slave interface** — 64-bit bus, full burst support for RV64 SoC integration
+- **GeLU activation** — 256-entry FP32 LUT on the result read path (combinational, no pipeline)
+- **IRQ support** — level-sensitive interrupt on computation complete
 
----
-
-## Key Results at a Glance
-
-| Parameter | 4×4 Array | 8×8 Array |
-|---|---|---|
-| Processing Elements | 16 | 64 |
-| Input Precision | INT8 (signed) | INT8 (signed) |
-| Accumulator Width | 32-bit | 32-bit |
-| Clock Frequency | **667 MHz** | **667 MHz** |
-| Technology | ASAP7 7nm FinFET | ASAP7 7nm FinFET |
-| Peak Throughput | **10.67 GOPS** | **42.67 GOPS** |
-| Latency (N×N matmul) | 7 cycles | 15 cycles |
-| Setup WNS | +21 ps ✓ | +21.6 ps ✓ |
-| Hold WNS | +79 ps ✓ | Met ✓ |
-| Total Power | **4.57 mW** | **14.05 mW** |
-| Power Efficiency | **2.33 GOPS/mW** | **3.04 GOPS/mW** |
-| Die Area | 192.8 × 192.8 µm | 370.4 × 370.4 µm |
-| Cell Count | 8,228 | 33,560 |
-| Placement Density | 56.9% | 56.6% |
-
-> **Scaling insight:** The 8×8 array delivers **4× throughput** at only **3.07× power**, yielding a **30% improvement in power efficiency** (GOPS/mW) over the 4×4 — demonstrating favorable systolic array scaling at 7nm.
+Earlier INT8 4×4 and 8×8 configurations have been taken through the full P&R flow and are timing-clean at **667 MHz** — results documented below.
 
 ---
 
 ## Architecture
 
 ```
-              Weight Columns (A matrix, top-to-bottom)
+              B columns (top edge, flow top-to-bottom)
                 ↓        ↓        ↓   ...   ↓
              a_col[0] a_col[1] a_col[2]  a_col[N-1]
                 |        |        |         |
-  b_row[0] → [PE00] → [PE01] → [PE02] → [PE0,N-1] →   Activation
-  b_row[1] → [PE10] → [PE11] → [PE12] → [PE1,N-1] →   Rows
-  b_row[2] → [PE20] → [PE21] → [PE22] → [PE2,N-1] →   (B matrix,
-     ...        |        |        |         |           left-to-right)
-  b_row[N-1]→[PEn0] → [PEn1] → [PEn2] → [PEn,N-1]→
-                |        |        |         |
-                ↓        ↓        ↓         ↓
+  b_row[0] → [PE00] → [PE01] → [PE02] → [PE0,N-1]
+  b_row[1] → [PE10] → [PE11] → [PE12] → [PE1,N-1]
+     ...
+  b_row[N-1]→[PEN0] → [PEN1] → [PEN2] → [PEN,N-1]
 
-  Each PE: acc += a_in * b_in (MAC operation)
-  Weights flow vertically, activations flow horizontally
-  Results accumulate in-place (output-stationary)
+  A rows (left edge, flow left-to-right)
+
+  Each PE: acc[i][j] += a_in * b_in  (BF16 multiply, FP32 accumulate)
+  Results C = A × B accumulate in-place (output-stationary)
+  Inputs are staggered by the skew controllers before entering the array.
 ```
 
 ### Block Diagram
 
 ```
-  ┌──────────────────────────────────────────────────┐
-  │                  systolic_top                      │
-  │              (ARRAY_SIZE = 4 or 8)                 │
-  │                                                    │
-  │  ┌─────────┐    ┌───────────┐    ┌──────────────┐ │
-  │  │ Matrix A │    │   Skew    │    │              │ │
-  │  │ Reg File │───▶│Controller │───▶│              │ │
-  │  └─────────┘    │   (A)     │    │   N × N      │ │
-  │                 └───────────┘    │  Systolic     │ │
-  │  ┌─────────┐    ┌───────────┐    │   Array      │ │
-  │  │ Matrix B │    │   Skew    │    │              │ │
-  │  │ Reg File │───▶│Controller │───▶│  (N² PEs)    │ │
-  │  └─────────┘    │   (B)     │    │              │ │
-  │                 └───────────┘    └──────┬───────┘ │
-  │  ┌───────────┐                          │         │
-  │  │   FSM     │── control signals ──────▶│         │
-  │  │Controller │                   Result[N][N]     │
-  │  └───────────┘                          ▼         │
-  └──────────────────────────────────────────────────┘
+  ┌──────────────────────────────────────────────────────────────┐
+  │                        tpu_top                               │
+  │  ┌─────────────────────────────────────────────────────────┐ │
+  │  │                  tpu_axi4_wrapper                        │ │
+  │  │  AXI4 Slave (64-bit, INCR burst)  IRQ  CTRL/MAT/RESULT  │ │
+  │  └───────────────────────┬─────────────────────────────────┘ │
+  │                          │ MMIO handshake signals             │
+  │  ┌───────────────────────▼─────────────────────────────────┐ │
+  │  │                    systolic_top                          │ │
+  │  │                                                          │ │
+  │  │  ┌──────────┐  ┌───────────┐                            │ │
+  │  │  │ Matrix A  │  │   Skew    │                            │ │
+  │  │  │ Reg File  │─▶│Controller │──▶ a_col[0..N-1]          │ │
+  │  │  └──────────┘  └───────────┘         │                  │ │
+  │  │                                       ▼                  │ │
+  │  │  ┌──────────┐  ┌───────────┐  ┌─────────────────┐       │ │
+  │  │  │ Matrix B  │  │   Skew    │  │  32×32 Systolic │       │ │
+  │  │  │ Reg File  │─▶│Controller │─▶│     Array       │       │ │
+  │  │  └──────────┘  └───────────┘  │   (1024 PEs)    │       │ │
+  │  │                                └────────┬────────┘       │ │
+  │  │  ┌───────────┐                          │ result[32][32]  │ │
+  │  │  │    FSM    │── control ──────────────▶│                 │ │
+  │  │  │Controller │               ┌──────────▼──────────┐     │ │
+  │  │  └───────────┘               │  GeLU Units (×32)   │     │ │
+  │  │                              │  (on result read)    │     │ │
+  │  │                              └─────────────────────┘     │ │
+  │  └─────────────────────────────────────────────────────────┘ │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -89,225 +81,208 @@ Both **4×4** and **8×8** array configurations have been taken through the full
 ## Module Hierarchy
 
 ```
-systolic_top (ARRAY_SIZE parameter)       (SystemVerilog)
-├── systolic_controller                   FSM: IDLE→CLEAR→LOAD→DRAIN→DONE
-├── input_skew_controller (×2)            Skew registers for A and B
-└── systolic_array (N×N)                  Parameterized PE mesh
-    └── processing_element (×N²)          Data flow + MAC
-        └── mac_unit                      8b×8b multiply + 32b accumulate
+tpu_top
+├── tpu_axi4_wrapper          AXI4 slave, MMIO, IRQ, burst FSMs
+└── systolic_top              32×32 systolic array top-level
+    ├── systolic_controller   FSM: IDLE→CLEAR→LOAD→DRAIN→DONE
+    ├── input_skew_controller (×2)  Stagger A rows and B columns
+    ├── systolic_array_32x32  1024-PE mesh
+    │   └── processing_element (×1024)
+    │       └── mac_unit      BF16×BF16→FP32, 2-stage pipeline
+    └── gelu_unit (×32)       Combinational GeLU on result read path
 ```
 
 ---
 
-## Physical Design Results
+## AXI4 Memory Map
 
-### 8×8 Array — Post-Route (Innovus, ASAP7 7nm)
+Base-relative, 64-bit data bus. Connect `tpu_top` to a RV64 AXI4 master.
 
-#### Timing (667 MHz, TT corner, 0.7V, 25°C)
-
-| Mode | WNS | Status |
+| Address | Register | Description |
 |---|---|---|
-| Setup | **+21.6 ps** | ✓ Met |
-| Hold | **Met** | ✓ Met |
+| `0x0000` | CTRL | `[4]=gelu_en` `[3]=irq_en` `[2]=done(RO)` `[1]=busy(RO)` `[0]=start(WO)` |
+| `0x1000` | MAT_A | Row i at `i×64B`. INCR burst, AWLEN=7 (8 beats × 4 BF16 per 64-bit word) |
+| `0x2000` | MAT_B | Same layout as MAT_A |
+| `0x3000` | RESULTS | Row i at `i×128B`. INCR burst, ARLEN=15 (16 beats × 2 FP32 per 64-bit word) |
 
-- Clock period: 1500 ps (667 MHz)
-- Operating condition: PVT_0P7V_25C
-- Critical path: `rd_row_addr[0]` → `rd_data[7][21]` (read-out mux logic)
+- Only INCR burst (`AWBURST/ARBURST = 2'b01`) is supported
+- `done` is latched; cleared when a new `start` is issued
+- `irq` is level-sensitive: `irq = irq_en & done`
 
-#### Power Breakdown (667 MHz, 0.2 activity)
+---
 
-| Component | Power (mW) | Percentage |
+## Computation Timing
+
+For N=32, MAC_LATENCY=2:
+
+| Phase | Cycles | Description |
+|---|---|---|
+| CLEAR | 1 | Zero accumulators and skew registers |
+| LOAD | 32 | Stream N rows of A and N columns of B through skew controllers |
+| DRAIN | 63 | Wait for last data to propagate to PE[31][31] and commit |
+| **Total** | **96** | Results valid on `done` pulse |
+
+---
+
+## Validated P&R Results (INT8, ASAP7 7nm)
+
+The following configurations have been taken through the full Genus + Innovus flow. These used INT8 inputs with 32-bit integer accumulators (the original design before BF16 upgrade).
+
+### 8×8 Array — Post-Route (667 MHz, TT 0.7V 25°C)
+
+| Metric | Value |
+|---|---|
+| Setup WNS | **+21.6 ps** ✓ |
+| Hold WNS | Met ✓ |
+| Total Power | **14.05 mW** |
+| Die Size | 370.4 × 370.4 µm |
+| Cell Count | 33,560 |
+| Placement Density | 56.6% |
+
+#### Power Breakdown
+
+| Component | Power (mW) | % |
 |---|---|---|
 | Internal | 9.607 | 68.4% |
 | Switching | 4.010 | 28.5% |
 | Leakage | 0.434 | 3.1% |
-| **Total** | **14.050** | **100%** |
+| **Total** | **14.050** | |
 
-| Group | Power (mW) | Percentage |
+| Group | Power (mW) | % |
 |---|---|---|
 | Combinational | 7.083 | 50.4% |
 | Sequential | 5.385 | 38.3% |
 | Clock Tree | 1.582 | 11.3% |
 
-#### Area & Physical
+#### Synthesis → P&R Comparison
 
-| Metric | Value |
-|---|---|
-| Die Size | 370.42 × 370.42 µm |
-| Cell Area | 73,016 µm² |
-| Total Instances | 33,560 |
-| Placement Density | 56.6% |
-| Register Count | 4,424 flip-flops |
-
-#### Clock Tree Synthesis
-
-| Metric | Value |
-|---|---|
-| CTS Buffers | 84 |
-| Clock Skew (late) | 14.4 ps |
-| Skew Window | 100% occupancy (82.8–97.2 ps) |
-| Max Source-Sink Length | 211.1 µm |
-| CTS Violations | **0** |
-| Max Leaf Fanout | 80 |
-| Buffer Depth | 3 levels |
-
-#### Synthesis → P&R Comparison (8×8)
-
-| Metric | Synthesis (Genus) | Post-P&R (Innovus) | Delta |
+| Metric | Genus | Innovus | Delta |
 |---|---|---|---|
-| Clock Period | 1500 ps | 1500 ps | — |
 | Setup WNS | 0 ps | +21.6 ps | Improved |
-| Cell Count | 31,520 | 33,560 | +6.5% (CTS + opt) |
+| Cell Count | 31,520 | 33,560 | +6.5% |
 | Cell Area | 70,544 µm² | 73,016 µm² | +3.5% |
-| Sequential | 4,424 | 4,424 | — |
 | Total Power | 19.91 mW | 14.05 mW | −29.4% |
-| Max Cap/Tran | 0 violations | 0 violations | — |
 
-> **Power reduction after P&R:** The 29% power drop from synthesis to post-route is expected — Genus uses global wire-load estimates that tend to overestimate switching power, while Innovus uses extracted parasitics from actual routing. The critical path also shifts from the MAC accumulator carry chain (synthesis) to the read-out mux decode logic (post-route).
+> Power reduction after P&R is expected: Genus uses wire-load estimates; Innovus uses extracted parasitics from actual routing.
 
-#### DRC Status
+#### DRC
 
 | Check | Result |
 |---|---|
-| Geometry DRC | 976 M3 Rect violations (ASAP7 M3 min-width; expected with 4× scaled LEF) |
-| Max Cap / Tran / Fanout | 0 violations |
-| Antenna | Clean |
-| SI Glitch | Clean |
-
-> **Note on M3 DRC:** The 976 M3 Rect violations are a known artifact of the ASAP7 4× scaled flow where the M3 minimum-width DRC rule is overly conservative relative to the standard-cell routing. These do not affect functionality or silicon viability in an academic PDK context.
+| Geometry DRC | 976 M3 Rect violations (known ASAP7 4× scaled LEF artifact) |
+| Cap / Tran / Fanout | 0 violations |
+| Antenna / SI | Clean |
 
 ---
 
-### 4×4 Array — Post-Route (Innovus, ASAP7 7nm)
+### 4×4 Array — Post-Route (667 MHz, TT corner)
 
-#### Timing (667 MHz, TT corner)
+| Metric | Value |
+|---|---|
+| Setup WNS | **+21 ps** ✓ |
+| Hold WNS | **+79 ps** ✓ |
+| Total Power | **4.57 mW** |
+| Die Size | 192.8 × 192.8 µm |
+| Cell Count | 8,228 |
 
-| Mode | WNS (ps) | TNS (ps) | Violating Paths |
-|---|---|---|---|
-| Setup | **+21** | 0.000 | 0 |
-| Hold | **+79** | 0.000 | 0 |
+#### Power Breakdown
 
-- 0 design rule violations
-- 0 glitch violations (SI clean)
-- 0.00% H / 0.01% V routing overflow
-
-#### Power Breakdown (667 MHz)
-
-| Component | Power (mW) | Percentage |
+| Component | Power (mW) | % |
 |---|---|---|
 | Internal | 2.238 | 48.9% |
 | Switching | 2.230 | 48.8% |
 | Leakage | 0.105 | 2.3% |
-| **Total** | **4.572** | **100%** |
-
-| Group | Power (mW) | Percentage |
-|---|---|---|
-| Combinational | 2.449 | 53.6% |
-| Sequential | 1.477 | 32.3% |
-| Clock Tree | 0.646 | 14.1% |
-
-#### Synthesis → P&R Comparison (4×4)
-
-| Metric | Synthesis | Post-P&R |
-|---|---|---|
-| Clock period | 1500 ps | 1500 ps |
-| Setup WNS | 0 ps | +21 ps |
-| Cell count | 7,888 | 8,228 |
-| Total power | 5.14 mW | 4.57 mW |
+| **Total** | **4.572** | |
 
 ---
 
-## Scaling Analysis: 4×4 → 8×8
+### Scaling Analysis: INT8 4×4 → 8×8
 
-| Metric | 4×4 | 8×8 | Ratio | Ideal (4×) |
-|---|---|---|---|---|
-| PEs | 16 | 64 | 4.0× | 4.0× |
-| Cell Count | 8,228 | 33,560 | 4.08× | 4.0× |
-| Die Area | 37,172 µm² | 137,211 µm² | 3.69× | 4.0× |
-| Total Power | 4.57 mW | 14.05 mW | 3.07× | 4.0× |
-| Peak GOPS | 10.67 | 42.67 | 4.0× | 4.0× |
-| GOPS/mW | 2.33 | 3.04 | 1.30× | 1.0× |
-| GOPS/mm² | 287 | 311 | 1.08× | 1.0× |
-| Flip-Flops | ~1,100 | 4,424 | 4.02× | 4.0× |
-| CTS Buffers | ~20 | 84 | ~4.2× | 4.0× |
+| Metric | 4×4 | 8×8 | Ratio |
+|---|---|---|---|
+| PEs | 16 | 64 | 4.0× |
+| Cell Count | 8,228 | 33,560 | 4.08× |
+| Die Area | 37,172 µm² | 137,211 µm² | 3.69× |
+| Total Power | 4.57 mW | 14.05 mW | 3.07× |
+| Peak GOPS | 10.67 | 42.67 | 4.0× |
+| GOPS/mW | 2.33 | 3.04 | 1.30× |
 
-The 8×8 configuration scales near-linearly in compute while achieving **sub-linear power growth**, resulting in better efficiency at larger array sizes. This is primarily due to amortization of control logic and clock distribution overhead across more PEs.
+Sub-linear power growth with linear throughput scaling — larger arrays are more efficient per operation.
+
+---
+
+## File Structure
+
+```
+rtl/
+├── tpu_top.sv                  Top-level: AXI4 wrapper + systolic_top
+├── tpu_axi4_wrapper.sv         AXI4 slave (MMIO, IRQ, burst read/write FSMs)
+├── systolic_top.sv             Systolic array top (matrix reg files, skew, GeLU)
+├── systolic_array_32x32.sv     32×32 PE mesh
+├── processing_element.sv       PE: systolic pass-through registers + MAC
+├── mac_unit.sv                 2-stage BF16×BF16→FP32 pipelined MAC
+├── input_skew_controller.sv    Channel-k delay-k stagger registers
+├── systolic_controller.sv      FSM controller (IDLE→CLEAR→LOAD→DRAIN→DONE)
+├── gelu_unit.sv                Combinational FP32 GeLU, 256-entry LUT
+└── gelu_lut.mem                GeLU LUT hex data (generate with script in gelu_unit.sv)
+```
 
 ---
 
 ## Tool Flow
 
 ```
-   SystemVerilog RTL (parameterized)
+   SystemVerilog RTL
         │
         ▼
    ┌──────────┐    Cadence Xcelium
-   │ Simulate  │──────────────────── 5/5 tests passed ✓
+   │ Simulate  │──────────────────── functional verification
    └──────────┘
         │
         ▼
    ┌──────────┐    Cadence Genus 23.14
    │ Synthesis │──────────────────── ASAP7 LVT + SLVT multi-Vt
-   └──────────┘                      4×4: 7,888 cells | 8×8: 31,520 cells
-        │                            Target: 667 MHz — WNS = 0 ps ✓
+   └──────────┘                      Target: 667 MHz
+        │
         ▼
    ┌──────────┐    Cadence Innovus 23.14
    │   P & R   │──────────────────── Floorplan → Place → CTS → Route
-   └──────────┘                      4×4: +21ps ✓ | 8×8: +21.6ps ✓
-        │                            OCV + SI-aware optimization
-        ▼
-   ┌──────────┐    Post-Route Opt + SI Analysis
-   │ Signoff   │──────────────────── Timing met, power characterized
-   └──────────┘
+   └──────────┘                      OCV + SI-aware optimization
         │
         ▼
-      DEF + Netlist + SDF
+   DEF + Netlist + SDF
 ```
 
 ---
 
-## Verification
+## Design Decisions
 
-5 automated tests with golden model comparison — **all passing**:
+1. **Output-Stationary Dataflow** — Each PE accumulates its own C[i][j] in place. Minimizes result data movement; optimal for weight-reuse inference.
 
-| Test | Description | Purpose |
-|---|---|---|
-| 1 | Identity matrix multiply | Basic sanity (A × I = A) |
-| 2 | Known small values | Hand-verifiable correctness |
-| 3 | Random matrices | Golden model comparison |
-| 4 | Back-to-back computation | Accumulator clearing between runs |
-| 5 | Signed (negative) numbers | Verify signed arithmetic paths |
+2. **BF16 Inputs / FP32 Accumulator** — BF16 (1s + 8e + 7m) matches the exponent range of FP32, making conversion trivial. FP32 accumulator avoids numeric overflow across the dot-product length.
+
+3. **Simplified FP Arithmetic (Option A)** — Flush-to-zero for denormals, truncate rounding, no NaN/Inf propagation. Sufficient for inference; eliminates IEEE 754 edge-case logic.
+
+4. **2-Stage MAC Pipeline** — Stage 1: BF16 multiply → FP32 product. Stage 2: FP32 accumulate. The controller extends DRAIN by `(MAC_LATENCY-1)` cycles to ensure the last product commits before results are read.
+
+5. **Skewed Input Feeding** — Channel k is delayed k cycles before entering the array. Aligns partial products across the diagonal wave without needing data buffering inside the array.
+
+6. **Full AXI4 (not AXI4-Lite)** — INCR burst transfers load an entire matrix row in one transaction (8 beats for 32×32 BF16 on a 64-bit bus), minimizing AXI transaction overhead.
+
+7. **32×32 for RV64** — WORDS_PER_ROW = (32×16)/64 = 8 beats per row. Balanced memory bandwidth vs. compute density on a 64-bit bus. 1024 MACs/cycle for transformer/CNN inference.
+
+8. **ROM-based GeLU** — 256-entry FP32 LUT covers x ∈ [−4, +4] at 1/32 resolution. Address extracted entirely from FP32 bit fields (no floating-point arithmetic in the address path). Purely combinational — zero pipeline latency on the result read path.
 
 ---
 
-## Project Structure
+## Future Work
 
-```
-tinyTPU/
-├── sources/                       # RTL source files
-│   ├── mac_unit.sv                # Multiply-accumulate unit
-│   ├── processing_element.sv      # PE with systolic registers
-│   ├── systolic_array.sv          # Parameterized N×N PE array
-│   ├── input_skew_controller.sv   # Input staggering logic
-│   ├── systolic_controller.sv     # FSM controller
-│   └── systolic_top.sv            # Top-level integration
-├── scripts/
-│   ├── syn_systolic.tcl           # Genus synthesis script
-│   ├── innovus.tcl                # Innovus P&R script (4×4)
-│   ├── innovus_8x8.tcl            # Innovus P&R script (8×8)
-│   ├── systolic_top.mmmc          # MMMC timing config (4×4)
-│   └── systolic_top_8x8.mmmc     # MMMC timing config (8×8)
-├── lib/                           # ASAP7 .lib timing libraries
-├── lef/                           # ASAP7 LEF physical libraries
-├── techlef/                       # ASAP7 technology LEF
-├── qrc/                           # RC extraction tech files
-├── PnR/
-│   ├── run/                       # Innovus working directory + reports
-│   └── scripts/                   # P&R scripts
-├── outputs/                       # Final deliverables (DEF, netlist, SDF)
-├── run/                           # Simulation / synthesis working dir
-└── README.md
-```
+- Synthesis and P&R of the 32×32 BF16 configuration
+- RTL simulation and verification of BF16 datapath
+- Multi-batch / streaming operation (continuous matrix feed without re-start)
+- Signoff STA with Cadence Tempus (multi-corner multi-mode)
+- QRC parasitic extraction for signoff-quality timing
+- Resolve M3 DRC violations with tighter routing constraints
 
 ---
 
@@ -317,53 +292,35 @@ tinyTPU/
 - **Cadence Genus** — Logic synthesis
 - **Cadence Innovus** — Place & route
 - **ASAP7 7nm PDK** — [GitHub](https://github.com/The-OpenROAD-Project/asap7)
+- **Python 3** — GeLU LUT generation (script embedded in `gelu_unit.sv`)
+
+---
 
 ## Quick Start
 
 ```bash
-# 1. Update ASAP7 library paths in scripts/
+# 1. Generate GeLU LUT (required before simulation/synthesis)
+python3 -c "
+import struct, math
+def fp32_hex(v): return '{:08x}'.format(struct.unpack('>I',struct.pack('>f',v))[0])
+with open('gelu_lut.mem','w') as f:
+    for i in range(256):
+        x = max(-4.0, min(4.0, (i-128)/32.0))
+        g = x * 0.5 * (1 + math.tanh(0.7978846*(x + 0.044715*x**3)))
+        f.write(fp32_hex(g) + '\n')
+"
 
-# 2. RTL simulation
+# 2. Update ASAP7 library paths in scripts/
+
+# 3. RTL simulation
 cd scripts && source run_sim.sh
 
-# 3. Synthesis (set ARRAY_SIZE in TCL script)
+# 4. Synthesis (set ARRAY_SIZE in TCL script)
 cd run && genus -f ../scripts/syn_systolic.tcl
 
-# 4. Place & Route — 4×4
+# 5. Place & Route
 cd PnR/run && innovus -init ../scripts/innovus.tcl
-
-# 5. Place & Route — 8×8
-cd PnR/run && innovus -init ../scripts/innovus_8x8.tcl
-
-# 6. View completed layout
-cd PnR/run && innovus
-innovus> restoreDesign ../outputs/systolic_top_8x8_innovus.dat
 ```
-
----
-
-## Design Decisions
-
-1. **Output-Stationary Dataflow** — Minimizes result data movement. Each PE accumulates its own C[i][j]. Best for inference where weight reuse is high.
-2. **INT8 Inputs / INT32 Accumulator** — Matches industry practice (Google TPU v1). 32-bit accumulator prevents overflow for N×N dot products.
-3. **Skewed Input Feeding** — Classic systolic technique. Each row/column is delayed by its index to align partial products correctly.
-4. **Simple FSM Controller** — 5-state machine (IDLE→CLEAR→LOAD→DRAIN→DONE) keeps control logic minimal and verifiable.
-5. **ASAP7 LVT + SLVT cells** — Multi-Vt optimization for performance/leakage tradeoff at 7nm.
-6. **667 MHz target** — Explored 1 GHz (too aggressive), 833 MHz (marginal), settled on 667 MHz with comfortable timing margin across both array sizes.
-7. **Parameterized ARRAY_SIZE** — Single RTL codebase supports both 4×4 and 8×8 (and beyond) through the `ARRAY_SIZE` parameter.
-
----
-
-## Future Work
-
-- Scale to 16×16 array
-- Add ReLU activation function
-- AXI4-Lite bus interface for SoC integration
-- FP16/BF16 precision support
-- Signoff STA with Cadence Tempus (multi-corner multi-mode)
-- QRC parasitic extraction for signoff-quality timing
-- Gate-level simulation with SDF back-annotation
-- Resolve remaining M3 DRC violations with tighter routing constraints
 
 ---
 
